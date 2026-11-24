@@ -4,6 +4,8 @@ AI に書かせたローカルの HTML をブラウザで開き、**気になる
 
 「3 つ目のカードの見出しが…」と場所を文章で説明する代わりに、テキストを選択してコメントを書くだけ。コメントは `ファイル:行番号` と引用付きの Markdown になるので、AI はどこをどう直せばいいかを取り違えません。
 
+![inliner のデモ: HTML を開き、テキストとボタンにコメントを付け、feedback.md を AI に渡し、AI の修正がページに反映されるまで](docs/demo.gif)
+
 ```
 AI が HTML を書く → inliner で開いてコメント → AI が .inliner/feedback.md を読んで修正
         ↑                                                      │
@@ -114,6 +116,7 @@ inliner clear               解決済みコメントを削除(--all ですべて
 ```sh
 go test ./...        # ユニットテスト
 node e2e/run.mjs     # 実ブラウザでの通しテスト(Node.js と Playwright が必要。無ければスキップ)
+node docs/demo/record.mjs   # 上のデモ GIF を撮り直す(ffmpeg も必要)
 go build -o inliner . && ./inliner page.html
 ```
 
