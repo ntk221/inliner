@@ -1,4 +1,5 @@
-node_modules/
+/inliner
+/inliner.exe
+/dist/
 .inliner/
-*.log
 .DS_Store

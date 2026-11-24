@@ -1,17 +1,19 @@
 // End-to-end check in a real browser: comment on a page, see the feedback file,
 // let "the AI" rewrite the page, and watch the comments follow.
 //
-//   npm run test:e2e
+//   node e2e/run.mjs
 //
-// Needs Playwright with Chromium (`npm i -g playwright`); skipped when it is missing.
+// Builds the binary with `go build` (or uses INLINER_BIN) and drives it with
+// Playwright + Chromium (`npm i -g playwright`); skipped when Playwright is missing.
 // Set INLINER_E2E_SHOTS=<dir> to keep screenshots of each step.
 
 import assert from 'node:assert/strict';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { startServer } from '../../src/server.js';
+import { fileURLToPath } from 'node:url';
 
 let chromium;
 try {
@@ -58,7 +60,32 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'inliner-e2e-'));
 fs.writeFileSync(path.join(root, 'page.html'), PAGE_V1);
 fs.writeFileSync(path.join(root, 'chart.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80"><rect width="240" height="80" fill="#93c5fd"/></svg>');
 
-const server = await startServer({ root, port: 0, pollMs: 100 });
+let bin = process.env.INLINER_BIN;
+if (!bin) {
+  bin = path.join(root, '..', `inliner-e2e-bin-${process.pid}${process.platform === 'win32' ? '.exe' : ''}`);
+  execFileSync('go', ['build', '-o', bin, '.'], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: 'inherit' });
+}
+
+// Start the real command, as a user would, and read the URL it prints.
+const child = spawn(bin, ['page.html', '--no-open', '--port', '0'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+const server = {
+  url: await new Promise((resolve, reject) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => {
+      out += chunk;
+      const m = /(http:\/\/localhost:\d+)\/page\.html/.exec(out);
+      if (m) resolve(m[1]);
+    });
+    child.on('exit', (code) => reject(new Error(`inliner exited with code ${code}:\n${out}`)));
+    child.on('error', reject);
+  }),
+  close: () =>
+    new Promise((resolve) => {
+      child.removeAllListeners('exit');
+      child.on('exit', resolve);
+      child.kill();
+    }),
+};
 const browser = await chromium.launch();
 const failures = [];
 
@@ -179,8 +206,8 @@ try {
   await waitFor(() => stored()[0].anchored === false);
   assert.match(feedback(), /#1 · `page\.html` · text[\s\S]*?was not found in the page as last rendered/);
 
-  // 8. Resolving from the command line (what the AI does) shows up in the open page.
-  server.store.setStatus([1], 'resolved', { by: 'cli', note: 'Named Acme and Globex.' });
+  // 8. The AI resolves the comment from the command line: the open page shows it.
+  assert.equal(execFileSync(bin, ['resolve', '1', '-m', 'Named Acme and Globex.'], { cwd: root, encoding: 'utf8' }), '#1 resolved\n');
   await page.locator('.note', { hasText: 'Named Acme and Globex.' }).waitFor();
   assert.equal(await page.locator('.fab .badge').textContent(), '3');
   assert.doesNotMatch(feedback(), /### #1 /);
@@ -199,6 +226,7 @@ try {
   await browser.close();
   await server.close();
   fs.rmSync(root, { recursive: true, force: true });
+  if (!process.env.INLINER_BIN) fs.rmSync(bin, { force: true });
 }
 
 async function waitFor(check, timeout = 5000) {

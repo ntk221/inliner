@@ -12,13 +12,13 @@ AI が HTML を書く → inliner で開いてコメント → AI が .inliner/f
 
 ## インストール
 
-Node.js 20 以上が必要です。依存パッケージはありません。
+Go 1.22 以上で入ります。単一バイナリで、実行時に必要なものはありません。
 
 ```sh
-npm install -g github:ntk221/inliner
+go install github.com/ntk221/inliner@latest
 ```
 
-インストールせずに試すなら `npx github:ntk221/inliner page.html`。
+`inliner` が見つからない場合は `$(go env GOPATH)/bin` を `PATH` に追加してください。インストールせずに試すなら `go run github.com/ntk221/inliner@latest page.html`。
 
 ## 使い方
 
@@ -103,6 +103,7 @@ inliner clear               解決済みコメントを削除(--all ですべて
 ## 仕組みと注意点
 
 - **ローカル専用のサーバー**です。`127.0.0.1` だけで待ち受け、`localhost` 宛て以外のリクエストや他サイトからの書き込みは拒否します。`.git` や `.env` などドットで始まるファイルは配信しません。
+- サーバーと CLI は Go(標準ライブラリのみ)、コメント UI は素の JavaScript 1 ファイルで、`embed` でバイナリに同梱しています。
 - 配信時に、各タグへソースの行番号(`data-inliner-line` 属性)を付け、コメント UI のスクリプトを 1 つ挿入します。変更するのはブラウザに送る内容だけで、ディスク上のファイルはそのままです。UI は Shadow DOM の中に描画するので、ページのスタイルとは干渉しません。
 - 行番号は「選択箇所を含む要素の開始タグの行」です。スクリプトで動的に生成された要素は、ソース上にある直近の親要素の行になります。
 - `.inliner/` には自動で `.gitignore` が作られ、コミット対象になりません。
@@ -111,6 +112,14 @@ inliner clear               解決済みコメントを削除(--all ですべて
 ## 開発
 
 ```sh
-npm test            # ユニットテスト
-npm run test:e2e    # 実ブラウザでの通しテスト(Playwright が入っている場合のみ実行)
+go test ./...        # ユニットテスト
+node e2e/run.mjs     # 実ブラウザでの通しテスト(Node.js と Playwright が必要。無ければスキップ)
+go build -o inliner . && ./inliner page.html
 ```
+
+| 場所 | 内容 |
+| --- | --- |
+| `main.go`, `internal/cli` | コマンドライン |
+| `internal/server` | ローカルサーバー、API、変更検知。`client.js` がブラウザ側のコメント UI |
+| `internal/annotate` | HTML への行番号付与とスクリプト挿入 |
+| `internal/store` | コメントの保存と `feedback.md` の生成 |
