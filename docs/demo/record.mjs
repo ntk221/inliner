@@ -15,7 +15,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const { chromium } = createRequire(import.meta.url)('playwright');
 
 const WIDTH = 1000;
-const HEIGHT = 620;
+const HEIGHT = 700;
 const CAPTION_HEIGHT = 46;
 const FPS = 10;
 const repo = fileURLToPath(new URL('../..', import.meta.url));
@@ -56,9 +56,10 @@ const page1 = (lead, buttonStyle) => `<!doctype html>
 `;
 
 const VAGUE = 'すごく便利でとても使いやすいプラン';
-const BEFORE = page1(`チームプランは、${VAGUE}です。<br>まずは 14 日間、無料でお試しください。`, 'padding: 8px 16px; background: #e5e5e2; color: #555; font-size: 14px;');
+const TRIAL = '14'; // the reviewer changes this to 30 by hand
+const BEFORE = page1(`チームプランは、${VAGUE}です。<br>まずは ${TRIAL} 日間、無料でお試しください。`, 'padding: 8px 16px; background: #e5e5e2; color: #555; font-size: 14px;');
 const AFTER = page1(
-  'チームプランは、メンバー数無制限・履歴 90 日保存で、<br>月額 980 円から使えます。まずは 14 日間、無料でお試しください。',
+  'チームプランは、メンバー数無制限・履歴 90 日保存で、<br>月額 980 円から使えます。まずは 30 日間、無料でお試しください。',
   'padding: 12px 28px; background: #2563eb; color: #fff; font-size: 16px; font-weight: 700;',
 );
 
@@ -69,8 +70,9 @@ const CAPTIONS = [
   '1. AI が書いた HTML を inliner で開く',
   '2. 気になるテキストを選択してコメント',
   '3. ボタンや画像は「要素を選択」でクリック',
-  '4. コメントは .inliner/feedback.md に。AI に「これを反映して」と頼むだけ',
-  '5. AI が直すと自動でリロード。対応メモも届く',
+  '4. ちょっとした文言は「編集」でその場で書き換え。ファイルに直接保存',
+  '5. コメントは .inliner/feedback.md に。AI に「これを反映して」と頼むだけ',
+  '6. AI が直すと自動でリロード。対応メモも届く',
 ];
 
 // --- helpers ---
@@ -88,7 +90,7 @@ function terminalHtml(command, lines) {
   return `<!doctype html>
 <meta charset="utf-8">
 <style>
-  body { margin: 0; padding: 18px 22px; background: #16181d; color: #d6d9df; font: 12.5px/1.5 "DejaVu Sans Mono", "IPAGothic", monospace; }
+  body { margin: 0; padding: 18px 22px; background: #16181d; color: #d6d9df; font: 12px/1.45 "DejaVu Sans Mono", "IPAGothic", monospace; }
   .prompt { color: #8bd49c; }
   .h { color: #7fb4ff; font-weight: 700; }
   .q { color: #f2c46d; }
@@ -256,13 +258,39 @@ try {
   await page.locator('.box:not(.draft)').waitFor();
   await pause(1600);
 
-  // 4. What the AI gets.
+  // 4. Fix a small thing by hand: it goes straight into the file.
+  caption();
+  const trial = await page.evaluate((needle) => {
+    const node = document.querySelector('.lead').lastChild;
+    const range = document.createRange();
+    range.setStart(node, node.data.indexOf(needle));
+    range.setEnd(node, node.data.indexOf(needle) + needle.length);
+    const r = range.getBoundingClientRect();
+    return { x1: r.left, x2: r.right, y: r.top + r.height / 2 };
+  }, `${TRIAL} 日間`);
+  await moveTo(trial.x1 + 1, trial.y, 700);
+  await page.mouse.down();
+  await moveTo(trial.x2 - 1, trial.y + 2, 500);
+  await page.mouse.up();
+  await pause(500);
+  await click(page.locator('.editbtn'));
+  await pause(500);
+  await page.keyboard.type('30 日間', { delay: 90 });
+  await pause(600);
+  const saved = page.waitForEvent('load');
+  await click(page.locator('.composer .primary'));
+  await saved;
+  await page.locator('.pin').first().waitFor();
+  await page.mouse.move(mouse.x, mouse.y);
+  await pause(1800);
+
+  // 5. What the AI gets.
   caption();
   const feedback = tidy(fs.readFileSync(path.join(site, '.inliner', 'feedback.md'), 'utf8'));
   await terminal('feedback', 'cat .inliner/feedback.md', feedback.replace(/\n+$/, '').split('\n'));
   await pause(4500);
 
-  // 5. The AI edits the file and resolves the comments; the page follows.
+  // 6. The AI edits the file and resolves the comments; the page follows.
   await page.goto(url);
   await page.locator('.pin').first().waitFor();
   await page.mouse.move(mouse.x, mouse.y);

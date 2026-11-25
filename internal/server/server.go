@@ -102,6 +102,8 @@ type Server struct {
 	done chan struct{}
 	once sync.Once
 
+	editMu sync.Mutex // one source edit at a time
+
 	mu       sync.Mutex
 	clients  map[chan string]struct{}
 	watched  map[string]*watchEntry // absolute path -> state
@@ -446,6 +448,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		return nil
 	}
 
+	if route == "/edits" && r.Method == http.MethodPost {
+		return s.handleEdit(w, r)
+	}
+
 	if m := commentRoute.FindStringSubmatch(route); m != nil {
 		id, _ := strconv.Atoi(m[1])
 		missing := &httpError{http.StatusNotFound, fmt.Sprintf("No comment #%d.", id)}
@@ -477,6 +483,68 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		}
 	}
 	return &httpError{http.StatusNotFound, "Unknown API route."}
+}
+
+// handleEdit writes a text change made in the browser back to the HTML file.
+// It refuses unless the text can be pinned to exactly one place in the very
+// version of the file the page was rendered from.
+func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		File   string `json:"file"`
+		Rev    string `json:"rev"`
+		At     int    `json:"at"`
+		Before string `json:"before"`
+		Old    string `json:"old"`
+		After  string `json:"after"`
+		New    string `json:"new"`
+	}
+	if err := readJSON(w, r, &in); err != nil {
+		return err
+	}
+	file, err := requireFile(in.File)
+	if err != nil {
+		return err
+	}
+	abs, rel, err := s.resolve("/" + file)
+	if err != nil {
+		return err
+	}
+	if !isHTML(abs) {
+		return &httpError{http.StatusBadRequest, "Only HTML files can be edited."}
+	}
+
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	st, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		return err
+	}
+	src := string(raw)
+	if annotate.Rev(src) != in.Rev {
+		return &httpError{http.StatusConflict, "The file has changed since this page was loaded."}
+	}
+	out, line, err := annotate.ReplaceText(src, annotate.TextEdit{At: in.At, Before: in.Before, Old: in.Old, After: in.After, New: in.New})
+	if errors.Is(err, annotate.ErrNotInSource) {
+		return &httpError{http.StatusUnprocessableEntity, "This text is not written in the HTML file as such, so it cannot be edited in place."}
+	}
+	if err != nil {
+		return err
+	}
+	if out != src {
+		if err := os.WriteFile(abs, []byte(out), st.Mode().Perm()); err != nil {
+			return err
+		}
+		// Open pages reload when the poller sees the new file.
+		if err := s.Store.AddEdit(store.Edit{File: rel, Line: line, Old: in.Old, New: in.New}); err != nil {
+			return err
+		}
+	}
+	sendJSON(w, http.StatusOK, map[string]int{"line": line})
+	return nil
 }
 
 // --- static files --------------------------------------------------------------

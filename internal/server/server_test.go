@@ -114,8 +114,8 @@ func TestServesPagesAndAssets(t *testing.T) {
 
 	html := do(t, "GET", srv.URL+"/page.html", "")
 	wantStatus(t, html, 200, "page")
-	wantMatch(t, html.body, `<p data-inliner-line="5">Hello world</p>`)
-	wantMatch(t, html.body, `<script src="/__inliner/client\.js" data-inliner-file="page\.html" defer></script>\n</body>`)
+	wantMatch(t, html.body, `<p data-inliner-line="5" data-inliner-at="\d+">Hello world</p>`)
+	wantMatch(t, html.body, `<script src="/__inliner/client\.js" data-inliner-file="page\.html" data-inliner-rev="[0-9a-f]{16}" defer></script>\n</body>`)
 	if got := html.header.Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control = %q", got)
 	}
@@ -367,4 +367,64 @@ func TestCloseEndsEventStreams(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("event stream still open after Close")
 	}
+}
+
+func TestEditWritesTextBackToTheFile(t *testing.T) {
+	srv := setup(t)
+	api := srv.URL + "/__inliner/api"
+	file := filepath.Join(srv.Root, "page.html")
+	read := func() string {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	// What the browser knows: the revision it was served and where <p> starts.
+	served := func() (rev, at string) {
+		body := do(t, "GET", srv.URL+"/page.html", "").body
+		rev = regexp.MustCompile(`data-inliner-rev="([0-9a-f]+)"`).FindStringSubmatch(body)[1]
+		at = regexp.MustCompile(`<p data-inliner-line="5" data-inliner-at="(\d+)"`).FindStringSubmatch(body)[1]
+		return rev, at
+	}
+	edit := func(rev, at, rest string) response {
+		return do(t, "POST", api+"/edits", fmt.Sprintf(`{"file":"page.html","rev":%q,"at":%s,%s}`, rev, at, rest))
+	}
+
+	rev, at := served()
+	res := edit(rev, at, `"before":"Hello ","old":"world","after":"","new":"<everyone> & you"`)
+	wantStatus(t, res, 200, "edit")
+	if res.body != "{\"line\":5}\n" {
+		t.Errorf("edit response = %q", res.body)
+	}
+	if want := strings.Replace(page, "Hello world", "Hello &lt;everyone&gt; &amp; you", 1); read() != want {
+		t.Errorf("file after edit:\n%s", read())
+	}
+	wantMatch(t, do(t, "GET", api+"/feedback", "").body, "## Edited directly by the reviewer[\\s\\S]*`page\\.html` \\(line 5 at the time\\): \"world\" → \"<everyone> & you\"")
+
+	// The page the browser still shows is now out of date: its offsets must not be trusted.
+	after := read()
+	wantStatus(t, edit(rev, at, `"before":"","old":"Hello","after":" <everyone> & you","new":"Bye"`), 409, "stale revision")
+
+	rev, at = served()
+	wantStatus(t, edit(rev, at, `"before":"","old":"Nothing like this","after":"","new":"x"`), 422, "text not in the source")
+	wantStatus(t, edit(rev, "1", `"before":"","old":"Hello","after":" <everyone> & you","new":"x"`), 422, "offset that is not a tag")
+	if read() != after {
+		t.Errorf("a refused edit changed the file")
+	}
+	wantStatus(t, edit(rev, at, `"before":"","old":"Hello","after":" <everyone> & you","new":"Bye"`), 200, "edit with the fresh revision")
+	if !strings.Contains(read(), "<p>Bye &lt;everyone&gt; &amp; you</p>") {
+		t.Errorf("file after second edit:\n%s", read())
+	}
+
+	for body, want := range map[string]int{
+		`{"file":"style.css","rev":"x","at":0,"old":"body","new":"x"}`:          400,
+		`{"file":"nope.html","rev":"x","at":0,"old":"a","new":"x"}`:             404,
+		`{"file":".inliner/x.html","rev":"x","at":0,"old":"a","new":"x"}`:       404,
+		`{"file":"../outside.html","rev":"x","at":0,"old":"a","new":"x"}`:       400,
+		`{"file":"docs/deep/a b.html","rev":"x","at":0,"old":"deep","new":"x"}`: 409,
+	} {
+		wantStatus(t, do(t, "POST", api+"/edits", body), want, body)
+	}
+	wantStatus(t, do(t, "POST", api+"/edits", `{"file":"page.html"}`, "Origin", "https://evil.example"), 403, "cross-origin edit")
 }

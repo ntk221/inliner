@@ -292,6 +292,16 @@ func TestSyncAnchors(t *testing.T) {
 		t.Errorf("SyncAnchors must not touch UpdatedAt")
 	}
 
+	// The text around the quote was rewritten: the feedback should show it as it is now.
+	prefix, suffix := "Oh, ", " there"
+	if changed, _ := s.SyncAnchors("page.html", []AnchorUpdate{{ID: 1, Line: 5, LineTag: "p", Prefix: &prefix, Suffix: &suffix}}); !changed {
+		t.Errorf("new context should count as a change")
+	}
+	if changed, _ := s.SyncAnchors("page.html", []AnchorUpdate{{ID: 1, Line: 5, LineTag: "p", Prefix: &prefix, Suffix: &suffix}}); changed {
+		t.Errorf("the same context twice should not")
+	}
+	wantMatch(t, mustFeedback(t, s, "", false), `In context: "…Oh, \[\[Hello\]\] there…"`)
+
 	if changed, _ := s.SyncAnchors("page.html", []AnchorUpdate{{ID: 1, Anchored: &no}}); !changed {
 		t.Errorf("losing the anchor should count as a change")
 	}
@@ -339,4 +349,39 @@ func TestCorruptStoreIsReportedNotOverwritten(t *testing.T) {
 	if raw, _ := os.ReadFile(s.File); string(raw) != "{ nope" {
 		t.Errorf("corrupt file was overwritten: %q", raw)
 	}
+}
+
+func TestDirectEditsAreReportedUntilCleared(t *testing.T) {
+	s := tempStore(t, map[string]string{"page.html": page})
+	if err := s.AddEdit(Edit{File: "page.html", Line: 4, Old: "Hello", New: "Hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddEdit(Edit{File: "other.html", Line: 9, Old: "gone", New: ""}); err != nil {
+		t.Fatal(err)
+	}
+
+	// With nothing else to say, the edits are still worth telling the AI about.
+	md, _ := os.ReadFile(s.FeedbackFile)
+	wantMatch(t, string(md), `No open comments\.\n\n## Edited directly by the reviewer`)
+	wantMatch(t, string(md), "- `page\\.html` \\(line 4 at the time\\): \"Hello\" → \"Hi\"")
+	wantMatch(t, string(md), "- `other\\.html` \\(line 9 at the time\\): \"gone\" → \\(deleted\\)")
+
+	mustAdd(t, s, textComment())
+	one := mustFeedback(t, s, "page.html", false)
+	wantMatch(t, one, `### #1 [\s\S]*## Edited directly by the reviewer[\s\S]*"Hello" → "Hi"`)
+	wantNoMatch(t, one, `other\.html`)
+
+	for i := 0; i < maxEdits+5; i++ {
+		if err := s.AddEdit(Edit{File: "page.html", Line: i + 1, Old: "a", New: "b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d, _ := s.read(); len(d.Edits) != maxEdits || d.Edits[len(d.Edits)-1].Line != maxEdits+5 {
+		t.Errorf("the log should keep the %d most recent edits, has %d", maxEdits, len(d.Edits))
+	}
+
+	if n, err := s.Clear(false); n != 0 || err != nil {
+		t.Errorf("Clear = %d, %v", n, err)
+	}
+	wantNoMatch(t, mustFeedback(t, s, "", false), `Edited directly`)
 }

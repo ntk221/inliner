@@ -67,6 +67,18 @@ type Comment struct {
 	Resolution *Resolution `json:"resolution,omitempty"`
 }
 
+// Edit records a change the reviewer made to a source file themselves, so
+// that the AI knows about it and does not undo it.
+type Edit struct {
+	File string `json:"file"`
+	Line int    `json:"line"` // where it was when the edit was made
+	Old  string `json:"old"`
+	New  string `json:"new"`
+	At   string `json:"at"`
+}
+
+const maxEdits = 50
+
 // NewComment is what a reviewer submits.
 type NewComment struct {
 	File   string `json:"file"`
@@ -87,6 +99,9 @@ type AnchorUpdate struct {
 	Anchored *bool  `json:"anchored"` // nil means still anchored
 	Line     int    `json:"line"`
 	LineTag  string `json:"lineTag"`
+	// Text comments: what surrounds the quote now. nil leaves it as it was.
+	Prefix *string `json:"prefix"`
+	Suffix *string `json:"suffix"`
 }
 
 // Error is a failure with the HTTP status the server should answer with:
@@ -106,6 +121,7 @@ type data struct {
 	Version  int       `json:"version"`
 	NextID   int       `json:"nextId"`
 	Comments []Comment `json:"comments"`
+	Edits    []Edit    `json:"edits,omitempty"`
 }
 
 // Store reads and writes the comments of one project root.
@@ -276,7 +292,7 @@ func (s *Store) write(d *data) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.WriteFile(s.FeedbackFile, []byte(Render(d.Comments, RenderOptions{Root: s.Root, CLI: CLICommand()})), 0o644)
+	return os.WriteFile(s.FeedbackFile, []byte(Render(d.Comments, d.Edits, RenderOptions{Root: s.Root, CLI: CLICommand()})), 0o644)
 }
 
 // update runs fn on the stored data under the lock and writes it back if fn
@@ -324,11 +340,38 @@ func (s *Store) List(file string) ([]Comment, error) {
 
 // Feedback renders the Markdown for the AI. file limits it to one page.
 func (s *Store) Feedback(file string, includeResolved bool) (string, error) {
-	comments, err := s.List(file)
+	d, err := s.read()
 	if err != nil {
 		return "", err
 	}
-	return Render(comments, RenderOptions{Root: s.Root, CLI: CLICommand(), IncludeResolved: includeResolved}), nil
+	comments, edits := d.Comments, d.Edits
+	if file != "" {
+		comments, edits = nil, nil
+		for _, c := range d.Comments {
+			if c.File == file {
+				comments = append(comments, c)
+			}
+		}
+		for _, e := range d.Edits {
+			if e.File == file {
+				edits = append(edits, e)
+			}
+		}
+	}
+	return Render(comments, edits, RenderOptions{Root: s.Root, CLI: CLICommand(), IncludeResolved: includeResolved}), nil
+}
+
+// AddEdit notes a change the reviewer made directly in a source file. Only the
+// most recent ones are kept.
+func (s *Store) AddEdit(e Edit) error {
+	return s.update(func(d *data) (bool, error) {
+		e.Old, e.New, e.At = truncate(e.Old, 2000), truncate(e.New, 2000), now()
+		d.Edits = append(d.Edits, e)
+		if len(d.Edits) > maxEdits {
+			d.Edits = d.Edits[len(d.Edits)-maxEdits:]
+		}
+		return true, nil
+	})
 }
 
 // Add stores a new open comment.
@@ -434,10 +477,13 @@ func (s *Store) SetStatus(ids []int, status, by, note string) (changed []Comment
 	return changed, missing, err
 }
 
-// Clear deletes resolved comments, or everything with all. It returns how many went.
+// Clear deletes resolved comments, or everything with all, and forgets the
+// reviewer's direct edits. It returns how many comments went.
 func (s *Store) Clear(all bool) (int, error) {
 	removed := 0
 	err := s.update(func(d *data) (bool, error) {
+		hadEdits := len(d.Edits) > 0
+		d.Edits = nil
 		keep := []Comment{}
 		if !all {
 			for _, c := range d.Comments {
@@ -448,13 +494,13 @@ func (s *Store) Clear(all bool) (int, error) {
 		}
 		removed = len(d.Comments) - len(keep)
 		d.Comments = keep
-		return removed > 0, nil
+		return removed > 0 || hadEdits, nil
 	})
 	return removed, err
 }
 
 // SyncAnchors records where the browser currently finds each comment (its line
-// number, or that it is gone). This is bookkeeping, not an edit: UpdatedAt is
+// number and surrounding text, or that it is gone). This is bookkeeping, not an edit: UpdatedAt is
 // left alone. It reports whether anything changed.
 func (s *Store) SyncAnchors(file string, updates []AnchorUpdate) (bool, error) {
 	changed := false
@@ -475,6 +521,20 @@ func (s *Store) SyncAnchors(file string, updates []AnchorUpdate) (bool, error) {
 					c.Anchor.Line = u.Line
 					c.Anchor.LineTag = lineTag
 					changed = true
+				}
+			}
+			if anchored && c.Kind == KindText {
+				for _, ctx := range []struct {
+					now  *string
+					kept *string
+				}{{u.Prefix, &c.Anchor.Prefix}, {u.Suffix, &c.Anchor.Suffix}} {
+					if ctx.now == nil {
+						continue
+					}
+					if v := truncate(*ctx.now, 64); v != *ctx.kept {
+						*ctx.kept = v
+						changed = true
+					}
 				}
 			}
 		}

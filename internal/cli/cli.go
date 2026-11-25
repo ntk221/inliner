@@ -28,7 +28,8 @@ Usage
   inliner resolve <id...>     Mark comments resolved        (-m "note" to say what changed)
   inliner reopen <id...>      Reopen resolved comments
   inliner rm <id...>          Delete comments
-  inliner clear               Delete resolved comments      (--all: delete every comment)
+  inliner clear               Delete resolved comments and the record of direct edits
+                              (--all: delete every comment too)
 
 Options
   -p, --port <n>     Port to listen on (default 4600, next free port if taken)

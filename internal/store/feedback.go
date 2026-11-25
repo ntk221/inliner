@@ -117,8 +117,29 @@ func describe(w *strings.Builder, c Comment, line int) {
 	w.WriteString("\n")
 }
 
-// Render writes review comments as Markdown addressed to the AI that wrote the HTML.
-func Render(comments []Comment, opts RenderOptions) string {
+// describeEdits lists what the reviewer changed in the files themselves.
+func describeEdits(w *strings.Builder, edits []Edit) {
+	if len(edits) == 0 {
+		return
+	}
+	if len(edits) > 20 {
+		edits = edits[len(edits)-20:]
+	}
+	w.WriteString("## Edited directly by the reviewer\n\n")
+	w.WriteString("The reviewer already made these changes in the source files. Keep them — do not revert them.\n\n")
+	for _, e := range edits {
+		replacement := "(deleted)"
+		if e.New != "" {
+			replacement = `"` + clip(e.New, 200) + `"`
+		}
+		fmt.Fprintf(w, "- %s (line %d at the time): \"%s\" → %s\n", code(e.File), e.Line, clip(e.Old, 200), replacement)
+	}
+	w.WriteString("\n")
+}
+
+// Render writes review comments as Markdown addressed to the AI that wrote the
+// HTML, followed by the edits the reviewer made themselves.
+func Render(comments []Comment, edits []Edit, opts RenderOptions) string {
 	var shown []Comment
 	open := 0
 	for _, c := range comments {
@@ -133,8 +154,9 @@ func Render(comments []Comment, opts RenderOptions) string {
 	var w strings.Builder
 	w.WriteString("# Inline review comments\n\n")
 	if len(shown) == 0 {
-		w.WriteString("No open comments.\n")
-		return w.String()
+		w.WriteString("No open comments.\n\n")
+		describeEdits(&w, edits)
+		return strings.TrimRight(w.String(), "\n") + "\n"
 	}
 
 	cli := opts.CLI
@@ -205,5 +227,6 @@ Apply each requested change to the source file. After addressing a comment, mark
 			describe(&w, it.c, it.line)
 		}
 	}
+	describeEdits(&w, edits)
 	return strings.TrimRight(w.String(), "\n") + "\n"
 }

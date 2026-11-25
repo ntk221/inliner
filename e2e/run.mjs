@@ -44,6 +44,8 @@ const PAGE_V1 = `<!doctype html>
        Costs stayed flat, so margins improved.</p>
     <img id="chart" src="chart.svg" alt="Revenue chart" width="240" height="80">
     <p>See the next page for details.</p>
+    <p id="dyn">placeholder</p>
+    <script>document.getElementById('dyn').textContent = 'Set by a script';</script>
   </main>
 </body>
 </html>
@@ -94,7 +96,10 @@ try {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   const page = await context.newPage();
   page.on('pageerror', (err) => failures.push(`page error: ${err.message}`));
-  page.on('console', (msg) => msg.type() === 'error' && failures.push(`console error: ${msg.text()}`));
+  page.on('console', (msg) => {
+    // Step 12 provokes a refusal on purpose; the browser logs every failed request.
+    if (msg.type() === 'error' && !/status of 422/.test(msg.text())) failures.push(`console error: ${msg.text()}`);
+  });
 
   const shot = async (name) => shots && page.screenshot({ path: path.join(shots, `${name}.png`) });
   const feedback = () => fs.readFileSync(path.join(root, '.inliner', 'feedback.md'), 'utf8');
@@ -220,6 +225,56 @@ try {
   await waitFor(() => stored().length === 3);
   await page.locator('.box:not(.draft)').waitFor({ state: 'detached' });
   await shot('4-resolved');
+
+  // 10. Edit text in place: it is written to the HTML file and the page reloads.
+  const source = () => fs.readFileSync(path.join(root, 'page.html'), 'utf8');
+  await page.locator('.link', { hasText: 'Close' }).click();
+  await selectText('#summary', 'Summary');
+  await page.locator('.editbtn').click();
+  assert.equal(await page.locator('.composer textarea').inputValue(), 'Summary');
+  assert.equal(await page.locator('.composer .hint').textContent(), 'Writes straight to the HTML file');
+  await shot('5-edit');
+  const edited = page.waitForEvent('load');
+  await page.locator('.composer textarea').fill('Key numbers & <facts>');
+  await page.keyboard.press('Control+Enter');
+  await edited;
+  assert.equal(await page.locator('#summary').textContent(), 'Key numbers & <facts>');
+  assert.match(source(), /<h2 id="summary">Key numbers &amp; &lt;facts&gt;<\/h2>/);
+  assert.match(feedback(), /## Edited directly by the reviewer[\s\S]*`page\.html` \(line 20 at the time\): "Summary" → "Key numbers & <facts>"/);
+  // Comment #2 sits right after the heading: its quoted context follows the edit.
+  await waitFor(() => /numbers & <facts> Revenue is \[\[up 120% year over year\. Costs stayed flat\]\]/.test(feedback()));
+
+  // 11. A selection that crosses a tag cannot be written back: it becomes a request for the AI.
+  const before = source();
+  await page.locator('.fab').waitFor();
+  await page.evaluate(() => {
+    const p = document.querySelector('main p');
+    const range = document.createRange();
+    range.setStart(p.firstChild, p.firstChild.data.indexOf('up'));
+    range.setEnd(p.lastChild, p.lastChild.data.indexOf(' year') + ' year'.length);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  });
+  await page.locator('.editbtn').click();
+  assert.match(await page.locator('.composer .hint').textContent(), /saved as a request for the AI/);
+  await page.locator('.composer textarea').fill('up 20% this year');
+  await page.locator('.composer .primary').click();
+  await page.locator('.card .body', { hasText: 'Replace this text with:\nup 20% this year' }).waitFor({ state: 'attached' });
+  assert.match(feedback(), /Selected text: "up 120% year"[\s\S]*> Replace this text with:\n> up 20% this year/);
+
+  // 12. Text a script put there is not in the file: the server refuses, and saving again leaves a request.
+  await selectText('#dyn', 'Set by a script');
+  await page.locator('.editbtn').click();
+  assert.equal(await page.locator('.composer .hint').textContent(), 'Writes straight to the HTML file');
+  await page.locator('.composer textarea').fill('Set by hand');
+  await page.locator('.composer .primary').click();
+  await page.locator('.toast', { hasText: 'not written in the HTML' }).waitFor();
+  assert.match(await page.locator('.composer .hint').textContent(), /saved as a request for the AI/);
+  await page.locator('.composer .primary').click();
+  await page.locator('.card .body', { hasText: 'Replace this text with:\nSet by hand' }).waitFor({ state: 'attached' });
+  await page.locator('.fab').click();
+  assert.equal(source(), before, 'refused edits must leave the file alone');
+  await shot('6-request');
 } catch (err) {
   failures.push(err.stack ?? String(err));
 } finally {

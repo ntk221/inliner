@@ -5,11 +5,13 @@
   'use strict';
   if (window.top !== window || window.__inlinerLoaded) return;
   const FILE = document.currentScript?.dataset.inlinerFile;
+  const REV = document.currentScript?.dataset.inlinerRev; // version of the file this page was rendered from
   if (!FILE || !document.body) return;
   window.__inlinerLoaded = true;
 
   const API = '/__inliner/api';
   const LINE_ATTR = 'data-inliner-line';
+  const AT_ATTR = 'data-inliner-at';
   const HOST_TAG = 'inliner-root';
   const SKIP = `script,style,noscript,template,${HOST_TAG}`;
   const CONTEXT = 32; // characters of text kept on each side of a quote
@@ -33,6 +35,13 @@
         page: 'ページ全体',
         placeholder: 'AI へのフィードバックを書く…',
         saveHint: '⌘/Ctrl + Enter で保存',
+        editDirect: 'HTML ファイルを直接書き換えます',
+        editRequest: 'ここは直接書き換えられないため、AI への依頼として保存します',
+        editSaved: 'ファイルに保存しました',
+        editStale: 'ファイルが更新されています。閉じると再読み込みするので、もう一度編集してください',
+        editNotInSource: 'この文字は HTML に直接書かれていません。もう一度保存すると AI への依頼として残します',
+        replaceWith: (text) => `この部分を次の文言に書き換えてください:\n${text}`,
+        deleteThis: 'この部分を削除してください',
         empty: 'まだコメントはありません。\nテキストを選択して「コメント」を押すか、\n「要素を選択」で画像やブロックを指定します。',
         resolved: '解決済み',
         orphan: '現在のページ内に該当箇所が見つかりません',
@@ -62,6 +71,13 @@
         page: 'Whole page',
         placeholder: 'Write feedback for the AI…',
         saveHint: '⌘/Ctrl + Enter to save',
+        editDirect: 'Writes straight to the HTML file',
+        editRequest: 'This cannot be edited in place, so it is saved as a request for the AI',
+        editSaved: 'Saved to the file',
+        editStale: 'The file has changed. Close this to reload the page, then edit again',
+        editNotInSource: 'This text is not written in the HTML as such. Save again to leave it as a request for the AI',
+        replaceWith: (text) => `Replace this text with:\n${text}`,
+        deleteThis: 'Delete this text',
         empty: 'No comments yet.\nSelect some text and press “Comment”,\nor use “Pick element” for images and blocks.',
         resolved: 'Resolved',
         orphan: 'This location is no longer found in the page',
@@ -97,7 +113,11 @@
       body: body ? JSON.stringify(body) : undefined,
     });
     const isJson = (res.headers.get('content-type') || '').includes('json');
-    if (!res.ok) throw new Error((isJson && (await res.json()).error) || res.statusText);
+    if (!res.ok) {
+      const err = new Error((isJson && (await res.json()).error) || res.statusText);
+      err.status = res.status;
+      throw err;
+    }
     return isJson ? res.json() : res.text();
   }
 
@@ -223,7 +243,11 @@
       }
     }
     if (best === -1) return null;
-    return offsetsToRange(index, index.map[best], index.map[best + quote.length - 1] + 1);
+    const range = offsetsToRange(index, index.map[best], index.map[best + quote.length - 1] + 1);
+    if (!range) return null;
+    // Also report what surrounds the quote now, which changes as the page is edited.
+    const end = best + quote.length;
+    return { range, context: { prefix: index.norm.slice(Math.max(0, best - CONTEXT), best), suffix: index.norm.slice(end, end + CONTEXT) } };
   }
 
   // --- locating elements --------------------------------------------------------
@@ -252,6 +276,7 @@
   function openTag(el) {
     const clone = el.cloneNode(false);
     clone.removeAttribute(LINE_ATTR);
+    clone.removeAttribute(AT_ATTR);
     return clip(clone.outerHTML.replace(/<\/[^>]+>$/, ''), 240);
   }
 
@@ -260,6 +285,21 @@
     const el = (node.nodeType === 1 ? node : node.parentElement)?.closest(`[${LINE_ATTR}]`);
     const line = Number(el?.getAttribute(LINE_ATTR));
     return line > 0 ? { line, lineTag: el.localName } : {};
+  }
+
+  /**
+   * Byte offset, in the HTML file, of the start tag that comes just before a
+   * text node — which is how the server finds that text in the file. Null for
+   * text the file does not contain as such (elements made by scripts).
+   */
+  function sourceTagBefore(text) {
+    if (!text.parentElement?.hasAttribute(AT_ATTR)) return null;
+    const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
+    walker.currentNode = text;
+    for (let el = walker.previousNode(); el; el = walker.previousNode()) {
+      if (el.hasAttribute(AT_ATTR)) return Number(el.getAttribute(AT_ATTR));
+    }
+    return null;
   }
 
   function locateElement(anchor) {
@@ -344,7 +384,10 @@
     .empty { color: var(--muted); text-align: center; white-space: pre-line; padding: 24px 4px; }
     .section { color: var(--muted); font-size: 12px; font-weight: 600; margin-top: 6px; }
 
-    .selbtn { position: fixed; top: 0; left: 0; box-shadow: var(--shadow); }
+    .selbar {
+      position: fixed; top: 0; left: 0; display: flex; gap: 4px; padding: 4px;
+      background: var(--bg); border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow);
+    }
     .composer {
       position: fixed; top: 0; left: 0; width: 320px; max-width: calc(100vw - 16px); padding: 10px;
       background: var(--bg); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
@@ -397,16 +440,20 @@
     list,
   );
 
-  const selBtn = h('button', {
-    class: 'btn primary selbtn',
-    hidden: true,
-    text: T.comment,
-    onmousedown: (e) => e.preventDefault(), // keep the page selection alive
-    onclick: commentOnSelection,
-  });
+  const selBar = h(
+    'div',
+    {
+      class: 'selbar',
+      hidden: true,
+      onmousedown: (e) => e.preventDefault(), // keep the page selection alive
+    },
+    h('button', { class: 'btn primary selbtn', text: T.comment, onclick: commentOnSelection }),
+    h('button', { class: 'btn editbtn', text: T.edit, onclick: editSelection }),
+  );
 
   const composerLabel = h('div', { class: 'meta' });
   const composerQuote = h('div', { class: 'quote' });
+  const composerHint = h('span', { class: 'hint' });
   const textarea = h('textarea', { placeholder: T.placeholder });
   const composer = h(
     'div',
@@ -417,14 +464,14 @@
     h(
       'div',
       { class: 'row' },
-      h('span', { class: 'hint', text: T.saveHint }),
+      composerHint,
       h('button', { class: 'btn', text: T.cancel, onclick: () => closeComposer() }),
       h('button', { class: 'btn primary', text: T.save, onclick: saveDraft }),
     ),
   );
   const toastEl = h('div', { class: 'toast', hidden: true });
 
-  const root = h('div', { class: 'root' }, layer, capture, fab, panel, selBtn, composer, toastEl);
+  const root = h('div', { class: 'root' }, layer, capture, fab, panel, selBar, composer, toastEl);
   shadow.append(h('style', { text: STYLE }), root);
 
   // Typing or clicking in the overlay must not trigger the page's own handlers
@@ -477,8 +524,7 @@
       if (c.kind === 'page') continue;
       let anchor = null;
       if (c.kind === 'text') {
-        const range = locateText(index, c.anchor);
-        if (range) anchor = { range };
+        anchor = locateText(index, c.anchor);
       } else {
         const el = locateElement(c.anchor);
         if (el) anchor = { el };
@@ -491,10 +537,13 @@
       const info = anchor ? lineInfo(anchor.el ?? anchor.range.startContainer) : {};
       const anchored = Boolean(anchor);
       const moved = anchored && info.line && (info.line !== c.anchor.line || info.lineTag !== c.anchor.lineTag);
-      if (c.anchored !== anchored || moved) {
+      const context = anchor?.context;
+      const drifted = context && (context.prefix !== (c.anchor.prefix ?? '') || context.suffix !== (c.anchor.suffix ?? ''));
+      if (c.anchored !== anchored || moved || drifted) {
         c.anchored = anchored;
         if (info.line) Object.assign(c.anchor, info);
-        updates.push({ id: c.id, anchored, ...info });
+        if (context) Object.assign(c.anchor, context);
+        updates.push({ id: c.id, anchored, ...info, ...context });
       }
     }
     if (updates.length) api('POST', '/anchors', { file: FILE, updates }).catch(() => {});
@@ -736,13 +785,15 @@
   function openComposer(next) {
     draft = next;
     setPicking(false);
-    selBtn.hidden = true;
+    selBar.hidden = true;
     const c = next.comment;
+    const editing = next.kind === 'edit'; // rewriting the page's text, as opposed to commenting on it
     const excerpt = c ? (c.kind === 'text' ? c.anchor.quote : c.anchor.text || c.anchor.tag) : next.anchor?.quote || next.anchor?.text || next.anchor?.tag;
-    composerLabel.textContent = c ? `#${c.id} · ${T.edit}` : next.kind === 'text' ? T.kindText : next.kind === 'element' ? T.kindElement : T.kindPage;
+    composerLabel.textContent = c ? `#${c.id} · ${T.edit}` : editing ? T.edit : next.kind === 'text' ? T.kindText : next.kind === 'element' ? T.kindElement : T.kindPage;
     composerQuote.textContent = excerpt ? clip(excerpt, 200) : '';
-    composerQuote.hidden = !excerpt;
-    textarea.value = c ? c.body : '';
+    composerQuote.hidden = !excerpt || editing;
+    composerHint.textContent = !editing ? T.saveHint : next.source ? T.editDirect : T.editRequest;
+    textarea.value = c ? c.body : editing ? next.old : '';
     composer.hidden = false;
 
     const existing = c ? anchors.get(c.id) : null;
@@ -750,6 +801,7 @@
     placeNear(composer, rects.at(-1) ?? firstRect(next.el ? { el: next.el } : existing));
     paint();
     textarea.focus();
+    if (editing) textarea.select();
   }
 
   function closeComposer() {
@@ -759,7 +811,46 @@
     if (reloadPending) location.reload();
   }
 
+  /**
+   * Save a rewrite of the selected text: into the HTML file when the server
+   * can pin the text down there, otherwise as a comment asking the AI to do it.
+   */
+  async function saveEdit() {
+    const next = textarea.value;
+    if (next === draft.old) return closeComposer();
+    try {
+      if (draft.source) {
+        try {
+          await api('POST', '/edits', { file: FILE, rev: REV, ...draft.source, new: next });
+        } catch (err) {
+          if (err.status === 409) {
+            reloadPending = true;
+            return toast(T.editStale, 6000);
+          }
+          if (err.status !== 422) throw err;
+          draft.source = null;
+          composerHint.textContent = T.editRequest;
+          return toast(T.editNotInSource, 6000);
+        }
+        document.getSelection()?.removeAllRanges();
+        closeComposer();
+        return toast(T.editSaved); // the page reloads once the server notices the new file
+      }
+      const body = next.trim() ? T.replaceWith(next.trim()) : T.deleteThis;
+      const created = await api('POST', '/comments', { file: FILE, kind: 'text', body, anchor: draft.anchor });
+      comments.push(created);
+      activeId = created.id;
+      document.getSelection()?.removeAllRanges();
+      toastEl.hidden = true; // the explanation of why this became a request has done its job
+      closeComposer();
+      refresh();
+    } catch (err) {
+      fail(err);
+    }
+  }
+
   async function saveDraft() {
+    if (draft?.kind === 'edit') return saveEdit();
     const body = textarea.value.trim();
     if (!body || !draft) return textarea.focus();
     try {
@@ -800,29 +891,55 @@
   function updateSelectionButton() {
     const range = draft || picking ? null : selectedRange();
     const rect = range && [...range.getClientRects()].filter((r) => r.width > 0 && r.height > 0).at(-1);
-    selBtn.hidden = !rect;
+    selBar.hidden = !rect;
     if (!rect) return;
-    const { width, height } = selBtn.getBoundingClientRect();
+    const { width, height } = selBar.getBoundingClientRect();
     const left = Math.max(8, Math.min(rect.right - width / 2, innerWidth - width - 8));
     const top = rect.bottom + 6 + height > innerHeight ? rect.top - height - 6 : rect.bottom + 6;
-    selBtn.style.transform = `translate(${Math.round(left)}px, ${Math.round(Math.max(8, top))}px)`;
+    selBar.style.transform = `translate(${Math.round(left)}px, ${Math.round(Math.max(8, top))}px)`;
   }
 
   function commentOnSelection() {
     const range = selectedRange()?.cloneRange();
     const described = range && describeTextRange(buildIndex(), range);
-    if (!described) return (selBtn.hidden = true);
+    if (!described) return (selBar.hidden = true);
     const node = range.commonAncestorContainer;
     const el = node.nodeType === 1 ? node : node.parentElement;
     const anchor = { ...described, selector: cssPath(el), tag: openTag(el), ...lineInfo(range.startContainer) };
     openComposer({ kind: 'text', range, anchor });
   }
 
+  function editSelection() {
+    const index = buildIndex();
+    const selected = selectedRange();
+    const offsets = selected && rangeToOffsets(index, selected);
+    // Snap the selection to the text it covers: a boundary resting between two
+    // nodes should not make it look as if the selection spanned both.
+    const range = offsets && offsetsToRange(index, offsets.start, offsets.end);
+    const described = range && describeTextRange(index, range);
+    if (!described) return (selBar.hidden = true);
+    const node = range.commonAncestorContainer;
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    const anchor = { ...described, selector: cssPath(el), tag: openTag(el), ...lineInfo(range.startContainer) };
+
+    // Text inside a single node can be written back to the file; anything
+    // wider (crossing a tag) becomes a request for the AI.
+    let source = null;
+    const text = range.startContainer;
+    if (REV && text === range.endContainer && text.nodeType === 3) {
+      const at = sourceTagBefore(text);
+      if (at !== null) {
+        source = { at, before: text.data.slice(0, range.startOffset), old: text.data.slice(range.startOffset, range.endOffset), after: text.data.slice(range.endOffset) };
+      }
+    }
+    openComposer({ kind: 'edit', range, anchor, source, old: range.toString() });
+  }
+
   let mouseDown = false;
   let selectionTimer;
   document.addEventListener('mousedown', () => {
     mouseDown = true;
-    selBtn.hidden = true;
+    selBar.hidden = true;
   });
   document.addEventListener('mouseup', () => {
     mouseDown = false;
@@ -854,7 +971,7 @@
     hoverBox.hidden = true;
     pickBtn.classList.toggle('on', on);
     if (on) {
-      selBtn.hidden = true;
+      selBar.hidden = true;
       toast(T.pickHint, 4000);
     } else if (toastEl.textContent === T.pickHint) {
       toastEl.hidden = true;
@@ -883,7 +1000,7 @@
       if (e.key !== 'Escape' || e.isComposing) return;
       if (draft) closeComposer();
       else if (picking) setPicking(false);
-      else if (!selBtn.hidden) selBtn.hidden = true;
+      else if (!selBar.hidden) selBar.hidden = true;
       else return;
       e.stopPropagation();
       e.preventDefault();
